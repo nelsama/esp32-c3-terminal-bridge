@@ -8,9 +8,10 @@ Firmware para **ESP32-C3 SuperMini** que implementa un puente WiFi bidireccional
 - **Modo dual WiFi**: Punto de acceso (AP) + Estación (STA) simultáneamente
 - **Pantalla OLED integrada**: Visualización de estado en tiempo real (U8g2)
 - **Interfaz web de configuración**: Selector de redes WiFi sin necesidad de código
-- **Puerto TCP RAW**: Conexión cruda en puerto 23 con TCP_NODELAY para mínima latencia
+- **Puerto Telnet (23)**: Conexión TCP con TCP_NODELAY para mínima latencia (< 1ms)
+- **LED de estado inteligente**: Hilo RTOS independiente con patrones dinámicos
 - **Persistencia**: Almacenamiento de credenciales WiFi en memoria no volátil
-- **Auto-reconexión**: Reintento automático en caso de pérdida de conexión
+- **Auto-reconexión**: Reintento automático en caso de pérdida de conexión (cada 5s)
 - **Sin adaptadores**: Elimina la necesidad de convertidores USB-TTL seriales
 
 ## 🛠️ Hardware
@@ -91,7 +92,7 @@ Muestra información de conexión WiFi, IP STA y opción de reset.
 
 ### Conexión TCP RAW
 
-El puerto 23 expone un **socket TCP puro** sin protocolo Telnet. No hay negociación ni buffering de línea. Conecta directamente y envía datos sin presionar ENTER.
+El puerto 23 expone un **socket Telnet** con TCP_NODELAY activado (no hay buffering de Nagle). Conecta directamente y envía datos sin presionar ENTER.
 
 ## ⚙️ Configuración de Cliente
 
@@ -127,7 +128,7 @@ nmap -p 23 192.168.1.100
 
 ### Cómo Conectarte (sin pedir ENTER)
 
-El puerto 23 es una **conexión TCP pura**, sin protocolo Telnet ni negociación de opciones. Elige tu herramienta:
+El puerto 23 es una **conexión Telnet** con `TCP_NODELAY` activado (sin algoritmo de Nagle). Los datos se envían inmediatamente, ideal para entrada de baja latencia. Elige tu herramienta:
 
 #### Linux / macOS - Netcat (recomendado)
 
@@ -265,11 +266,11 @@ socket.on('error', (err) => {
 });
 ```
 
-**Características del Puerto RAW (23)**:
+**Características del Puerto Telnet (23)**:
 - ✅ TCP_NODELAY activado: latencia mínima (< 1ms)
 - ✅ Transparencia total: los datos pasan sin procesamiento
 - ✅ Bidireccional: envío y recepción simultáneamente
-- ✅ Sin protocolo: solo datos puros
+- ✅ Sin buffering de Nagle: cada byte viaja inmediatamente
 
 ### Problemas Comunes de Cliente
 
@@ -280,6 +281,8 @@ socket.on('error', (err) => {
 | Datos recibidos corruptos | Velocidad UART mismatch | Verificar BAUD_RATE (115200 en código) |
 | Telnet muestra caracteres extraños | Negociación Telnet interfiere | Usar netcat o modo Raw en PuTTY |
 | Latencia alta (> 100ms) | WiFi débil o cliente lento | Acercar ESP32 al router, revisar RSSI |
+| LED siempre apagado | Firmware no inició correctamente | Comprobar consola serie, verificar voltaje |
+| LED no parpadea con datos | `lastActivityTime` no se actualiza | Verificar conexión Telnet y tráfico UART |
 
 ## 📊 Protocolo de Comunicación
 
@@ -296,6 +299,78 @@ Dispositivo Cliente (TCP/23) ↔ ESP32-C3 ↔ Dispositivo Serial (UART Serial1)
 
 ## 🔍 Monitoreo
 
+### Pantalla OLED
+
+Estados mostrados:
+- Inicialización (ESP32-C3, Bridge, v4.0-Stable)
+- Modo AP con IP
+- Estado WiFi (conectado/desconectado)
+- IP STA cuando está conectado
+
+### LED de Estado (GPIO 8)
+
+El LED integrado en el ESP32-C3 SuperMini parpadea automáticamente en un **hilo RTOS independiente** (prioridad baja) para indicar el estado sin bloquear el programa principal.
+
+#### Tabla de Patrones del LED
+
+| Patrón Visual | Frecuencia | Significado | Estado del Sistema |
+|---------------|-----------|-------------|-------------------|
+| **Apagado** | Continuo | Firmware no iniciado o en reset | Boot / Reinicio por WDT |
+| **Parpadeo lento** | ~1 Hz (1000 ms ON/OFF) | 🔹 Heartbeat / Idle | Firmware activo, sin tráfico UART ni TCP |
+| **Parpadeo rápido** | ~12–25 Hz (40 ms ON/OFF) | 🔹 Actividad de Datos | Tráfico bidireccional activo (datos FPGA, respuesta cliente Telnet) |
+| **Encendido fijo** | Continuo | 🔴 Error Crítico | Bloqueo de tareas, stack overflow (no debería ocurrir) |
+
+#### Cómo Funciona
+
+```cpp
+// Tarea RTOS dedicada al LED (no bloquea loop principal)
+void ledTask(void *pvParameters) {
+  // Verifica si hay actividad en los últimos 200ms
+  bool hasActivity = (now - lastActivityTime < 200);
+  
+  // Intervalo dinámico basado en actividad
+  unsigned long interval = hasActivity ? 40 : 1000;
+  
+  // Alterna el LED según el intervalo
+  digitalWrite(LED_PIN, state);
+  vTaskDelay(10 / portTICK_PERIOD_MS);  // Cede CPU cada 10ms
+}
+```
+
+**Ventajas**:
+- ✅ No bloquea el loop principal
+- ✅ Parpadeo suave y sin jitter
+- ✅ Cambio automático según carga de datos
+- ✅ CPU eficiente (solo 10ms de quantum)
+
+#### Registrar Actividad
+
+La actividad se registra automáticamente en:
+
+```cpp
+lastActivityTime = millis();  // Se actualiza cuando:
+```
+
+1. Cliente Telnet se conecta
+2. Datos llegan de UART (Serial1) → se envían a Telnet
+3. Datos llegan de Telnet → se envían a UART (Serial1)
+
+El LED se apaga después de **200ms sin actividad** (heartbeat suave).
+
+### Monitoreo en Vivo (LED + OLED)
+
+Ejemplo de sesión típica:
+
+1. **Al encender**: LED apagado, OLED muestra boot
+2. **Setup listo**: LED comienza **parpadeo lento** (~1 Hz) → firmware activo en AP mode
+3. **Conectar WiFi**: LED acelera a **parpadeo rápido**, OLED muestra "Conectando..."
+4. **WiFi conectado**: LED vuelve a **parpadeo lento**, OLED muestra IP STA
+5. **Cliente Telnet se conecta**: LED → **parpadeo rápido**
+6. **Enviar datos** (FPGA ↔ Telnet): LED continúa **rápido** (activo 200ms)
+7. **Sin datos 200ms**: LED → **parpadeo lento** (idle)
+
+**En código**: Todas las operaciones de red/datos actualizan `lastActivityTime = millis()` que es monitoreada por `ledTask()`.
+
 ### Consola Serie
 
 La salida por USB muestra eventos importantes:
@@ -304,25 +379,18 @@ La salida por USB muestra eventos importantes:
 UART FPGA iniciada
 AP listo: 192.168.4.1
 ✅ WiFi Conectado: 192.168.1.100
-Cliente RAW conectado
+Cliente Telnet conectado
+⚠️ WiFi perdido. Cerrando Telnet...
 🔄 Reconectando...
 ```
 
-### Pantalla OLED
-
-Estados mostrados:
-- Inicialización (ESP32-C3, Bridge RAW, v1.0)
-- Modo AP con IP
-- Estado WiFi (conectado/desconectado)
-- IP STA cuando está conectado
-
 ## 🛡️ Seguridad
 
-> ⚠️ **Advertencia**: Este firmware está diseñado para entorno local de confianza (LAN). La red AP tiene credencial por defecto (`12345678`) y el puente RAW no tiene autenticación.
+> ⚠️ **Advertencia**: Este firmware está diseñado para entorno local de confianza (LAN). La red AP tiene credencial por defecto (`12345678`) y el puente Telnet no tiene autenticación.
 >
 > Para uso en producción o redes públicas:
 > - Cambiar contraseña AP en código
-> - Implementar autenticación en puente RAW
+> - Implementar autenticación en puente Telnet
 > - Usar WiFi con WPA3 si es posible
 > - Considerar VPN si se expone a Internet
 
@@ -333,11 +401,57 @@ Estados mostrados:
 #define OLED_SCL 6
 #define UART_RX_PIN 20
 #define UART_TX_PIN 21
+#define LED_PIN 8              // LED integrado
 #define BAUD_RATE 115200
-#define RAW_PORT 23
+#define RAW_PORT 23            // Puerto Telnet
 ```
 
 Edita `src/main.cpp` para cambiar valores según tu hardware.
+
+## 🔄 Arquitectura RTOS
+
+El firmware usa **FreeRTOS** (incluido en ESP-IDF) con tareas independientes:
+
+### Tareas (Tasks)
+
+| Tarea | Prioridad | Función | Comportamiento |
+|-------|-----------|---------|----------------|
+| **loop()** | 1 (baja) | Loop principal del sketch Arduino | No bloqueante, maneja WiFi y Telnet |
+| **ledTask** | 1 (baja) | Control del LED de estado | Parpadea según actividad, no bloquea |
+| **WiFi handler** | 2 (media) | Manejo interno de WiFi | Gestionado por Arduino/ESP-IDF |
+| **Web server** | 2 (media) | Servidor HTTP | No bloqueante (async) |
+
+### Sincronización
+
+- **`lastActivityTime`**: Variable `volatile` compartida entre `loop()` y `ledTask`
+- **`vTaskDelay()`**: Cede CPU al scheduler, permite multithreading real
+- **No hay mutex**: Escritura de entero es atómica en ESP32 (32-bit)
+
+### Ventajas
+
+✅ **No bloqueante**: El LED parpadea sin afectar al servidor web o Telnet  
+✅ **Responsive**: La entrada del usuario no espera a actualizaciones de OLED  
+✅ **Eficiente**: CPU comparte tiempo entre tareas, idle durante esperas
+
+### Configuración FreeRTOS
+
+```cpp
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+// Crear tarea del LED
+xTaskCreate(
+  ledTask,              // Función de tarea
+  "LED_Task",           // Nombre legible
+  2048,                 // Stack size (bytes)
+  NULL,                 // Parámetros
+  1,                    // Prioridad (1=baja)
+  NULL                  // Handle (opcional)
+);
+
+// Dentro de la tarea: ceder CPU
+vTaskDelay(10 / portTICK_PERIOD_MS);  // 10ms
+```
 
 ## 🔧 Troubleshooting
 
@@ -347,9 +461,37 @@ Edita `src/main.cpp` para cambiar valores según tu hardware.
 | OLED no se ve | Comprobar conexión I2C (pines 5, 6) |
 | UART no comunica | Verificar velocidad (115200), pines RX/TX del dispositivo serial |
 | Datos no pasan | Verificar que el dispositivo esté conectado correctamente al UART |
-| Pérdida de WiFi | Aumentar `RECONNECT_MS` en main.cpp |
+| Pérdida de WiFi | Aumentar `RECONNECT_MS` en main.cpp (actualmente 5000ms) |
 | Latencia alta | Verificar TCP_NODELAY está activo, revisar RSSI WiFi |
-| Búferes llenos | Aumentar tamaño de búfer en código |
+| Búferes llenos | Aumentar tamaño de búfer en código (actualmente 128 bytes) |
+| LED siempre apagado | Firmware no inició, comprobar consola serie, verificar voltaje |
+| LED no parpadea con datos | Verificar conexión Telnet y tráfico UART |
+
+## 🛠️ Personalización del LED
+
+Para modificar el comportamiento del LED:
+
+```cpp
+// En main.cpp - función ledTask()
+
+// Cambiar sensibilidad de detección de actividad:
+unsigned long ACTIVITY_THRESHOLD = 200;  // Actualmente 200ms
+bool hasActivity = (now - lastActivityTime < ACTIVITY_THRESHOLD);
+
+// Cambiar velocidades de parpadeo:
+unsigned long IDLE_INTERVAL = 1000;      // Heartbeat: 1000ms (1 Hz)
+unsigned long ACTIVE_INTERVAL = 40;      // Actividad: 40ms (~25 Hz)
+unsigned long interval = hasActivity ? ACTIVE_INTERVAL : IDLE_INTERVAL;
+
+// Cambiar tiempo de respuesta del scheduler:
+unsigned long SCHEDULER_QUANTUM = 10;    // Quantum: 10ms
+vTaskDelay(SCHEDULER_QUANTUM / portTICK_PERIOD_MS);
+
+// Cambiar prioridad de la tarea (1=baja, 3=alta):
+xTaskCreate(ledTask, "LED_Task", 2048, NULL, 1, NULL);  // ← prioridad aquí
+```
+
+**Nota**: Aumentar prioridad del LED puede afectar responsividad de Telnet. Mantener en prioridad 1 (igual que loop).
 
 ## 📦 Estructura del Proyecto
 
@@ -364,33 +506,66 @@ Edita `src/main.cpp` para cambiar valores según tu hardware.
 └── test_bootloader.sh      # Script de prueba bootloader
 ```
 
-## 🔄 Ciclo de Vida de Conexión
+## 🔄 Ciclo de Vida de Conexión y Ejecución
+
+### Booteo (Setup)
 
 ```
 ┌─────────────────────────────────────────┐
-│  Inicio (Setup)                         │
+│  Inicialización (setup())               │
 ├─────────────────────────────────────────┤
 │ 1. Inicializar UART con dispositivo     │
 │ 2. Inicializar pantalla OLED            │
 │ 3. Cargar credenciales WiFi guardadas   │
 │ 4. Activar modo AP + STA                │
-│ 5. Iniciar servidor web + RAW           │
+│ 5. Iniciar servidor web + Telnet        │
+│ 6. ✅ Crear tarea RTOS del LED          │
+│ 7. Mostrar pantalla de boot             │
 └────────────────┬──────────────────────┘
                  │
          ┌───────▼──────────┐
-         │  Loop principal  │
+         │  Loop + LED en   │
+         │  paralelo (RTOS) │
          └────────┬─────────┘
-                  │
-    ┌─────────────┼─────────────┐
-    │             │             │
-    ▼             ▼             ▼
-Verificar   Puente RAW    Reconexión
-WiFi status (si STA OK)   automática
-    │             │             │
-    └─────────────┼─────────────┘
-                  │
-            Actualizar OLED
 ```
+
+### Runtime (Loop Principal + Tareas RTOS)
+
+```
+                    ┌─────────────────────────────────┐
+                    │  FreeRTOS Scheduler             │
+                    │  (~10ms de quantum por tarea)   │
+                    └──────────┬─────────────────────┘
+                              │
+            ┌─────────────────┼─────────────────┐
+            │                 │                 │
+      ┌─────▼────┐   ┌────────▼────────┐  ┌───▼──────┐
+      │ loop()   │   │  ledTask()      │  │ WiFi/Web │
+      │ (Puerto  │   │  (LED State)    │  │ (RTOS)   │
+      │ Principal│   │                 │  │          │
+      │ )        │   │ • Verifica      │  │ Handlers │
+      ├──────────┤   │   actividad     │  ├──────────┤
+      │• Telnet  │   │ • Parpadea      │  │ • DNS    │
+      │• WiFi    │   │   dinámica      │  │ • HTTP   │
+      │  status  │   │ • Cede CPU cada │  │ • Crypto │
+      │• Sync    │   │   10ms          │  │ • Timers │
+      │• OLED    │   │                 │  │          │
+      │  update  │   └─────────────────┘  └──────────┘
+      │          │
+      └──────────┘
+            ↓
+      Actualizar
+      lastActivityTime
+      ↓
+      ledTask() lee
+      el valor
+```
+
+**Puntos clave**:
+- `loop()` **nunca bloquea** (no hay `delay()` prolongados)
+- `ledTask()` cede CPU con `vTaskDelay(10ms)` → no consume ciclos esperando
+- Scheduler de FreeRTOS alterna entre tareas automáticamente
+- `lastActivityTime` es la única variable compartida (atómica en ESP32)
 
 ## 💡 Casos de Uso
 
@@ -398,6 +573,7 @@ WiFi status (si STA OK)   automática
 - **IoT**: Conectar sensores/actuadores seriales a WiFi sin hardware adicional
 - **Debugging**: Inspeccionar tráfico serial desde cualquier cliente TCP
 - **Prototipado**: Alternativa a adaptadores USB-TTL costosos
+- **Monitoreo visual**: El LED indica estado del sistema en tiempo real (heartbeat, actividad de datos, errores)
 
 ## 📚 Referencias
 
@@ -406,6 +582,8 @@ WiFi status (si STA OK)   automática
 - [PlatformIO ESP32](https://docs.platformio.org/en/latest/platforms/espressif32.html)
 - [U8g2 Library](https://github.com/olikraus/u8g2)
 - [Arduino WiFi API](https://www.arduino.cc/reference/en/libraries/wifi/)
+- [FreeRTOS ESP32](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/freertos_idf.html) - Documentación de multithreading y tareas
+- [TCP_NODELAY](https://linux.die.net/man/7/tcp) - Explicación del algoritmo de Nagle y su desactivación
 
 ## 📄 Licencia
 
