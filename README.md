@@ -1,23 +1,24 @@
-# ESP32 DB9 Joysticks - Puente WiFi/UART
+# ESP32 UART/WiFi Bridge
 
-Firmware para **ESP32-C3 SuperMini** que implementa un puente WiFi bidireccional para comunicación con FPGA mediante UART, ideal para sistemas de control de entrada de videojuegos retro con joysticks DB9.
+Firmware para **ESP32-C3 SuperMini** que implementa un puente WiFi bidireccional para comunicación UART. Proporciona conectividad TCP/WiFi a dispositivos serie sin necesidad de adaptador USB-TTL.
 
-## 🎮 Características
+## � Características
 
-- **Puente WiFi/UART optimizado**: Comunicación de baja latencia entre clientes WiFi y FPGA
+- **Puente UART/WiFi transparente**: Transporte TCP ↔ Serial sin procesamiento de datos
 - **Modo dual WiFi**: Punto de acceso (AP) + Estación (STA) simultáneamente
 - **Pantalla OLED integrada**: Visualización de estado en tiempo real (U8g2)
 - **Interfaz web de configuración**: Selector de redes WiFi sin necesidad de código
 - **Puerto TCP RAW**: Conexión cruda en puerto 23 con TCP_NODELAY para mínima latencia
 - **Persistencia**: Almacenamiento de credenciales WiFi en memoria no volátil
 - **Auto-reconexión**: Reintento automático en caso de pérdida de conexión
+- **Sin adaptadores**: Elimina la necesidad de convertidores USB-TTL seriales
 
 ## 🛠️ Hardware
 
 | Componente | Especificación |
 |-----------|---------------|
 | Microcontrolador | ESP32-C3 SuperMini |
-| Pantalla | OLED 72×40 (SSD1306) |
+| Pantalla SerialED 72×40 (SSD1306) |
 | Conexión FPGA | UART (Serial1) |
 | USB | USB-C nativo (CDC) |
 | Pines I2C | SDA=5, SCL=6 |
@@ -103,21 +104,21 @@ telnet <IP-DEL-ESP32> 23
 exec 3<>/dev/tcp/<IP-DEL-ESP32>/23; cat >&3; cat <&3
 ```
 
-El puerto RAW (23) está optimizado con **TCP_NODELAY** activado para garantizar latencia mínima (< 1ms) en entrada de videojuegos.
+El puerto RAW (23) está optimizado con **TCP_NODELAY** activado para garantizar latencia mínima (< 1ms).
 
 ## 📊 Protocolo de Comunicación
 
 El puente simplemente retransmite datos bidireccionales sin procesamiento:
 
 ```
-Dispositivo Cliente (TCP/23) ↔ ESP32-C3 ↔ FPGA (UART Serial1)
+Dispositivo Cliente (TCP/23) ↔ ESP32-C3 ↔ Dispositivo Serial (UART Serial1)
 ```
 
-- **Velocidad UART**: 115200 bps
+- **Velocidad UART**: 115200 bps (configurable)
 - **Tamaño de búfer**: 64 bytes
 - **Modo**: No bloqueante (lectura y escritura asincrónicas)
-
-### Ejemplo de uso
+- **Transparencia**: Sin procesamiento ni interpretación de datos
+ (Python)
 
 ```python
 import socket
@@ -125,13 +126,33 @@ import socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect(('<IP-DEL-ESP32>', 23))
 
-# Enviar datos a FPGA
+# Enviar datos al dispositivo serial
 sock.sendall(b'\x01\x02\x03')
 
-# Recibir datos de FPGA
+# Recibir datos del dispositivo serial
 data = sock.recv(64)
 print(data.hex())
 
+sock.close()
+```
+
+### Ejemplo de uso (Node.js)
+
+```javascript
+const net = require('net');
+
+const socket = net.createConnection(23, '<IP-DEL-ESP32>', () => {
+  console.log('Conectado');
+  socket.write(Buffer.from([0x01, 0x02, 0x03]));
+});
+
+socket.on('data', (data) => {
+  console.log('Recibido:', data.toString('hex'));
+});
+
+socket.on('end', () => {
+  console.log('Desconectado');
+});
 sock.close()
 ```
 
@@ -139,10 +160,13 @@ sock.close()
 
 ### Consola Serie
 
-La salida por USB muestra eventos importantes:
-
-```
-UART FPGA iniciada
+La salida por USB muestra eventos importantes: (LAN). La red AP tiene credencial por defecto (`12345678`) y el puente RAW no tiene autenticación.
+> 
+> Para uso en producción o redes públicas:
+> - Cambiar contraseña AP en código
+> - Implementar autenticación en puente RAW
+> - Usar WiFi con WPA3 si es posible
+> - Considerar VPN si se expone a Internet
 AP listo: 192.168.4.1
 ✅ WiFi Conectado: 192.168.1.100
 Cliente RAW conectado
@@ -160,9 +184,11 @@ Estados mostrados:
 ## 🛡️ Seguridad
 
 > ⚠️ **Advertencia**: Este firmware está diseñado para entorno local de confianza. La red AP tiene credencial por defecto (`12345678`). Para uso en producción:
-> - Cambiar contraseña AP en código
-> - Implementar autenticación en puente RAW
-> - Usar WiFi con WPA3 si es posible
+> - Cambiar contraseña AP en códigodel dispositivo serial |
+| Datos no pasan | Verificar que el dispositivo esté conectado correctamente al UART |
+| Pérdida de WiFi | Aumentar `RECONNECT_MS` en main.cpp |
+| Latencia alta | Verificar TCP_NODELAY está activo, revisar RSSI WiFi |
+| Búferes llenos | Aumentar `#define` de tamaño de búfer en códig
 
 ## 📝 Pines de Configuración
 
@@ -207,14 +233,19 @@ Edita `src/main.cpp` para cambiar valores según tu hardware.
 │  Inicio (Setup)                         │
 ├─────────────────────────────────────────┤
 │ 1. Inicializar UART con FPGA            │
-│ 2. Inicializar pantalla OLED            │
-│ 3. Cargar credenciales WiFi guardadas   │
-│ 4. Activar modo AP + STA                │
-│ 5. Iniciar servidor web + RAW           │
-└────────────────┬──────────────────────┘
-                 │
-         ┌───────▼──────────┐
-         │  Loop principal  │
+│ 2ESP32-C3 Arduino Core](https://docs.espressif.com/projects/arduino-esp32/en/latest/)
+- [PlatformIO ESP32](https://docs.platformio.org/en/latest/platforms/espressif32.html)
+- [U8g2 Library](https://github.com/olikraus/u8g2)
+- [A� Casos de Uso
+
+- **Comunicación remota**: Acceder a dispositivos seriales desde la red local
+- **IoT**: Conectar sensores/actuadores seriales a WiFi sin hardware adicional
+- **Debugging**: Inspeccionar tráfico serial desde cualquier cliente TCP
+- **Prototipado**: Alternativa a adaptadores USB-TTL costosos
+
+## 📄 Licencia
+
+Especifica según tu proyecto
          └────────┬─────────┘
                   │
     ┌─────────────┼─────────────┐
