@@ -30,7 +30,13 @@ String savedPass = "";
 bool isConnected = false;
 unsigned long lastScreenUpdate = 0;
 unsigned long reconnectTimer = 0;
-const unsigned long RECONNECT_MS = 5000;
+const unsigned long RECONNECT_MS = 10000;  // 10s entre intentos (menos espikes de corriente)
+
+// 🔑 Variables para validar conexión estable
+unsigned long wifiConnectedTime = 0;
+const unsigned long STABLE_CONNECTION_MS = 3000;  // Debe estar conectado 3s para validar (más tolerante)
+unsigned long lastValidCheck = 0;
+const unsigned long VALIDATION_INTERVAL_MS = 2000;  // Verificar conexión cada 2s
 
 // 🔑 Variables para LED (compartidas con hilo)
 volatile unsigned long lastActivityTime = 0;
@@ -50,6 +56,7 @@ void ledTask(void *pvParameters);  // Hilo del LED
 // ==========================================
 void setup() {
   Serial.begin(115200);
+  delay(1500);  // 🔑 Booteo estable con UART conectado
   Serial1.begin(BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
   Serial.println("UART FPGA iniciada");
 
@@ -59,7 +66,7 @@ void setup() {
 
   Wire.begin(OLED_SDA, OLED_SCL);
   u8g2.begin();
-  u8g2.setContrast(255);
+  u8g2.setContrast(255);  // Restaurado a máximo
   showBootScreen();
 
   prefs.begin("wifi", false);
@@ -95,14 +102,37 @@ void loop() {
 
   // 1. 🔑 Sincronizar estado real del WiFi
   wl_status_t status = WiFi.status();
-  if (status == WL_CONNECTED && !isConnected) {
-    isConnected = true;
-    updateOLED();
-    Serial.println("✅ WiFi Conectado: " + WiFi.localIP().toString());
-  } else if (status != WL_CONNECTED && isConnected) {
+  
+  // ✅ Si está conectado, comenzar a contar tiempo de estabilidad
+  if (status == WL_CONNECTED && wifiConnectedTime == 0) {
+    wifiConnectedTime = millis();
+    Serial.println("📡 [WiFi] Conectado detectado. Validando estabilidad (5s)...");
+  }
+  
+  // ⏱️ Si perdió conexión durante validación, resetear contador
+  if (status != WL_CONNECTED && wifiConnectedTime > 0) {
+    if (millis() - wifiConnectedTime < STABLE_CONNECTION_MS) {
+      Serial.println("⚠️ [WiFi] Conexión perdida durante validación (brownout?)");
+    }
+    wifiConnectedTime = 0;
+  }
+  
+  // ✅ Validar que la conexión sea ESTABLE (5 segundos mínimo)
+  if (status == WL_CONNECTED && wifiConnectedTime > 0 && (millis() - wifiConnectedTime >= STABLE_CONNECTION_MS)) {
+    if (!isConnected) {
+      isConnected = true;
+      lastValidCheck = millis();
+      updateOLED();
+      Serial.println("✅ [WiFi] CONEXIÓN ESTABLECIDA (ESTABLE): " + WiFi.localIP().toString());
+    }
+  }
+  
+  // ❌ Monitoreo continuo: si estamos conectados, verificar que siga siéndolo
+  if (isConnected && status != WL_CONNECTED) {
     isConnected = false;
+    wifiConnectedTime = 0;
     updateOLED();
-    Serial.println("⚠️ WiFi perdido. Cerrando Telnet...");
+    Serial.println("❌ [WiFi] CONEXIÓN PERDIDA. Volviendo a AP Mode.");
     if (telnetClient.connected()) telnetClient.stop();
   }
 
@@ -111,9 +141,19 @@ void loop() {
     handleTelnetBridge();
   }
 
-  // 3. 🔁 Auto-reconexión no bloqueante
+  // 3. 🔁 Auto-reconexión no bloqueante (con protección contra brownouts)
   if (status != WL_CONNECTED && savedSSID.length() > 0 && millis() - reconnectTimer > RECONNECT_MS) {
-    Serial.println("🔄 Reconectando...");
+    // NO reconectar si hay mucha actividad UART (puede causar spike de corriente)
+    if (Serial1.available() > 0) {
+      Serial.println("⚠️ [Reconexión] Pospuesta: hay actividad UART");
+      reconnectTimer = millis();
+      return;  // No intentes ahora, deja que la UART termine
+    }
+    
+    Serial.print("🔄 [WiFi] Reintentando con: ");
+    Serial.print(savedSSID);
+    Serial.print(" | Estado: ");
+    Serial.println(WiFi.status());
     WiFi.begin(savedSSID.c_str(), savedPass.c_str());
     reconnectTimer = millis();
   }
@@ -286,13 +326,34 @@ void showBootScreen() {
 void updateOLED() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_5x8_tr);
+  
+  wl_status_t status = WiFi.status();
+  
   if (isConnected) {
+    // Modo conectado
     u8g2.drawStr(0, 10, "WiFi:OK");
     String s = WiFi.SSID();
     if (s.length() > 12) s = s.substring(0, 12);
     u8g2.drawStr(0, 20, s.c_str());
     u8g2.drawStr(0, 30, WiFi.localIP().toString().c_str());
+  } else if (status == WL_CONNECTED && wifiConnectedTime > 0) {
+    // Validando conexión (esperando 5s para confirmar)
+    u8g2.drawStr(0, 10, "WiFi:VALID");
+    unsigned long elapsed = millis() - wifiConnectedTime;
+    String s = WiFi.SSID();
+    if (s.length() > 12) s = s.substring(0, 12);
+    u8g2.drawStr(0, 20, s.c_str());
+    
+    char buf[16];
+    snprintf(buf, sizeof(buf), "  %lus/%lus", elapsed/1000, STABLE_CONNECTION_MS/1000);
+    u8g2.drawStr(0, 30, buf);
+  } else if (savedSSID.length() > 0 && status != WL_CONNECTED) {
+    // Intentando reconectar
+    u8g2.drawStr(0, 10, "AP Mode");
+    u8g2.drawStr(0, 20, "192.168.4.1");
+    u8g2.drawStr(0, 30, "Retry...");
   } else {
+    // AP Mode - esperando configuración inicial
     u8g2.drawStr(0, 10, "AP Mode");
     u8g2.drawStr(0, 20, "192.168.4.1");
     u8g2.drawStr(0, 30, "PW:12345678");
