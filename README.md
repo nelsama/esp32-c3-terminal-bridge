@@ -45,7 +45,7 @@ lib_deps =
 
 ```bash
 git clone <url-del-repositorio>
-cd esp-32-db9-joys
+cd esp32-uart-wifi-bridge
 ```
 
 ### 2. Compilar y cargar
